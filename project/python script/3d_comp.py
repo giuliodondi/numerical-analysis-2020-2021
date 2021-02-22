@@ -1,5 +1,5 @@
 
-
+import math
 import numpy as np
 #import matplotlib.pyplot as plt
 
@@ -180,68 +180,113 @@ def matvec_3D_matfree_jit(vinput, n, K, M):
     return u.reshape((n**3,))
     
 
-@cuda.jit
-def matvec_3D_matfree_cuda(vinput, n, K, M):
-    v = vinput.reshape((n,n,n))
-    
-    u = cuda.shared.array(shape=(n, n, n), dtype=float32)
-    Mv= cuda.shared.array(shape=(n, n, n), dtype=float32)
-    Kv= cuda.shared.array(shape=(n, n, n), dtype=float32)
-    MMv=cuda.shared.array(shape=(n, n, n), dtype=float32)
-    KMv=cuda.shared.array(shape=(n, n, n), dtype=float32)
-    MKv=cuda.shared.array(shape=(n, n, n), dtype=float32)
-    
-    
-    for k in range(0, n):
-        for l in range(0, n):
-            for m in range(0, n):
-                for aux in range(0, n): 
-                    Mv[k,l,m] += M[k,aux]*v[l,m,aux]
-                    Kv[k,l,m] += K[k,aux]*v[l,m,aux]
-                    
-                
-    for j in range(0, n):
-        for k in range(0, n):
-            for l in range(0, n):
-                for aux in range(0, n):
-                    MMv[j,k,l] += M[j,aux]*Mv[k,l,aux]
-                    KMv[j,k,l] += K[j,aux]*Mv[k,l,aux]
-                    MKv[j,k,l] += M[j,aux]*Kv[k,l,aux]
-                    
-    
-    for i in range(0, n):
-        for j in range(0, n):
-            for k in range(0, n):
-                for aux in range(0, n):
-                    u[i,j,k] += K[i,aux]*MMv[j,k,aux]
-                    u[i,j,k] += M[i,aux]*KMv[j,k,aux]
-                    u[i,j,k] += M[i,aux]*MKv[j,k,aux]
-                    u[i,j,k] += M[i,aux]*MMv[j,k,aux]
-                    
 
-                
-    return u.reshape((n**3,))    
+'''
+simple cuda kernel of the matmult function
+every thread calculates an element of each intermediate matrix and synchronises
+'''
+@cuda.jit
+def cuda_matfree3D_ker(n,vd, ud,M,K,Mv,Kv,MMv,KMv,MKv):
     
+
+    
+    
+    #absolute position of thread in grid
+    gx, gy, gz = cuda.grid(3)
+    
+    
+    
+    if gx < n and gy < n and gz < n :
+    
+
+        for aux in range(0, n): 
+            Mv[gx,gy,gz] += M[gx,aux]*vd[gy,gz,aux]
+            Kv[gx,gy,gz] += K[gx,aux]*vd[gy,gz,aux]
+        
+        cuda.syncthreads()
+
+
+        for aux in range(0, n):
+            MMv[gx,gy,gz] += M[gx,aux]*Mv[gy,gz,aux]
+            KMv[gx,gy,gz] += K[gx,aux]*Mv[gy,gz,aux]
+            MKv[gx,gy,gz] += M[gx,aux]*Kv[gy,gz,aux]
+
+
+        cuda.syncthreads()
+
+        for aux in range(0, n):
+            ud[gx,gy,gz] += K[gx,aux]*MMv[gy,gz,aux]
+            ud[gx,gy,gz] += M[gx,aux]*KMv[gy,gz,aux]
+            ud[gx,gy,gz] += M[gx,aux]*MKv[gy,gz,aux]
+            ud[gx,gy,gz] += M[gx,aux]*MMv[gy,gz,aux]
+        
+        cuda.syncthreads()
+    
+
+'''
+wrapper function for the cuda kernel, initialises device memory
+and communicated the 1D matrices and the vector
+'''
+def matvec_3D_matfree_cuda(vinput, n, K, M): 
+    v = vinput.reshape((n,n,n))
+    u = np.zeros((n,n,n),dtype=np.float64)
+    
+    vd = cuda.to_device(v)
+    Kd = cuda.to_device(K)
+    Md = cuda.to_device(M)
+    
+    ud= cuda.device_array((n,n,n),dtype=np.float64)
+    Mv= cuda.device_array((n,n,n),dtype=np.float64)
+    Kv= cuda.device_array((n,n,n),dtype=np.float64)
+    MMv=cuda.device_array((n,n,n),dtype=np.float64)
+    KMv=cuda.device_array((n,n,n),dtype=np.float64)
+    MKv=cuda.device_array((n,n,n),dtype=np.float64)
+    
+    tpb = 8
+    bpg = math.ceil(n/8)
+    threadsperblock = (tpb,tpb,tpb)
+    blockspergrid = (bpg,bpg,bpg)
+    cuda_matfree3D_ker[blockspergrid, threadsperblock](n,vd, ud,Md,Kd,Mv,Kv,MMv,KMv,MKv)
+    
+   
+    
+    u = ud.copy_to_host()
+    
+    return u.reshape((n**3,))  
+    
+    
+#initialise the numba functions and compile them
+sizen = 4
+vv = np.ones((sizen**3))
+B,K,M,A = compute_one_dimensional_matrices(sizen) 
+u1=matvec_3D_naive(vv, sizen, K,M  )
+u2=matvec_3D_matfree_jit(vv, sizen, K,M  )
+u3=matvec_3D_matfree_cuda(vv, sizen, K,M  )
+
+
+
 
 all_n = np.arange(5,20,2)
 
 naive_file = 'naive_out_times_log.txt'
 matfree_file = 'matfree_out_times_log.txt'
 matfree_jit_file = 'matfree_jit_out_times_log.txt'
+matfree_cuda_file = 'matfree_cuda_out_times_log.txt'
 
 iters = 10
 
 
-naive_times_n = np.zeros((iters+1,np.size(all_n)), dtype=np.float64)
+#naive_times_n = np.zeros((iters+1,np.size(all_n)), dtype=np.float64)
 matfree_times_n = np.zeros((iters+1,np.size(all_n)), dtype=np.float64)
 matfree_jit_times_n = np.zeros((iters+1,np.size(all_n)), dtype=np.float64)
+matfree_cuda_times_n = np.zeros((iters+1,np.size(all_n)), dtype=np.float64)
 
 
 for nn in range(0,np.size(all_n)):
 	n = all_n[nn]
 	print(n)
 
-	naive_times_n[0,nn] = n
+	n#aive_times_n[0,nn] = n
 	matfree_times_n[0,nn] = n
 	matfree_jit_times_n[0,nn] = n
 	
@@ -250,15 +295,16 @@ for nn in range(0,np.size(all_n)):
 	B,K,M,A = compute_one_dimensional_matrices(n)
 
 	#AAA = compute_3D_matrices(n,K,M)
+	
+	vec = np.random.uniform(low=-1, high=1, size=(n**3,))
 
 	for i in range(iters):
 
 
-		vec = np.random.uniform(low=-1, high=1, size=(n**3,))
 
-		start = timer()
-		matvec_3D_naive(vec, n, K,M  )
-		naive_times_n[i+1,nn] = (timer() - start)
+		#start = timer()
+		#matvec_3D_naive(vec, n, K,M  )
+		#naive_times_n[i+1,nn] = (timer() - start)
 		
 		start = timer()
 		matvec_3D_matfree(vec, n, K,M  )
@@ -268,12 +314,18 @@ for nn in range(0,np.size(all_n)):
 		start = timer()
 		matvec_3D_matfree_jit(vec, n, K,M  )
 		matfree_jit_times_n[i+1,nn] = (timer() - start)
+		
+		
+		start = timer()
+		matvec_3D_matfree_cuda(vec, n, K,M  )
+		matfree_cuda_times_n[i+1,nn] = (timer() - start)
 
 
-	np.savetxt(naive_file, naive_times_n[:,0:nn], delimiter=',')
+	#np.savetxt(naive_file, naive_times_n[:,0:nn], delimiter=',')
 	np.savetxt(matfree_file, matfree_times_n[:,0:nn], delimiter=',')
 	np.savetxt(matfree_jit_file, matfree_jit_times_n[:,0:nn], delimiter=',')
-	time.sleep(10)
+	np.savetxt(matfree_cuda_file, matfree_cuda_times_n[:,0:nn], delimiter=',')
+
     
 
     #start = timer()
